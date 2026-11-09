@@ -1,7 +1,5 @@
-import { FFmpeg } from "@ffmpeg/ffmpeg";
-import { fetchFile, toBlobURL } from "@ffmpeg/util";
-
 let ffmpegInstance = null;
+let utilModule = null;
 
 const CORE_VERSION = "0.12.6";
 const BASE_CDN_URL = `https://unpkg.com/@ffmpeg/core@${CORE_VERSION}/dist/esm`;
@@ -9,10 +7,17 @@ const DEFAULT_FONT_URL =
   "https://raw.githubusercontent.com/ffmpegwasm/testdata/master/arial.ttf";
 
 export async function initFFmpeg(onLogCallback) {
-  if (ffmpegInstance && ffmpegInstance.loaded) {
-    return ffmpegInstance;
+  if (ffmpegInstance && ffmpegInstance.loaded && utilModule) {
+    return { ffmpeg: ffmpegInstance, ...utilModule };
   }
 
+  // Lazy load FFmpeg & Util from ESM CDN only when user clicks Export
+  const [{ FFmpeg }, { fetchFile, toBlobURL }] = await Promise.all([
+    import(/* @vite-ignore */ "https://esm.sh/@ffmpeg/ffmpeg@0.12.10"),
+    import(/* @vite-ignore */ "https://esm.sh/@ffmpeg/util@0.12.1"),
+  ]);
+
+  utilModule = { fetchFile, toBlobURL };
   const ffmpeg = new FFmpeg();
 
   if (onLogCallback) {
@@ -43,7 +48,7 @@ export async function initFFmpeg(onLogCallback) {
   }
 
   ffmpegInstance = ffmpeg;
-  return ffmpegInstance;
+  return { ffmpeg: ffmpegInstance, fetchFile, toBlobURL };
 }
 
 function sanitizeDrawText(text) {
@@ -61,7 +66,6 @@ export function buildFFmpegCommand(cut, inputFileName, outputFileName) {
     !aspectRatio || aspectRatio === "16:9" || aspectRatio === "original";
   const hasText = trimmedText.length > 0;
 
-  // Fast Cut: Original ratio + No text = Instant stream copy
   if (isOriginalRatio && !hasText) {
     return [
       "-ss",
@@ -76,7 +80,6 @@ export function buildFFmpegCommand(cut, inputFileName, outputFileName) {
     ];
   }
 
-  // Filter Chain: Crop and/or Text Overlay
   const videoFilters = [];
 
   if (aspectRatio === "9:16") {
@@ -129,7 +132,7 @@ export async function processVideoCuts(videoFile, cuts, onProgressUpdate) {
     });
   }
 
-  const ffmpeg = await initFFmpeg();
+  const { ffmpeg, fetchFile } = await initFFmpeg();
 
   const fileExtension = videoFile.name.split(".").pop() || "mp4";
   const inputFileName = `source_input.${fileExtension}`;
