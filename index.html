@@ -1,1 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Client-Side Video Trimmer</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+  </head>
+  <body class="bg-slate-950 text-slate-100 antialiased">
+    <!-- Ab ye div kabhi black nahi rahega -->
+    <div id="root">
+      <div id="boot-loader" class="min-h-screen flex flex-col items-center justify-center p-6 text-center">
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-6 max-w-lg w-full">
+          <h2 class="text-lg font-bold text-white mb-2">Loading Video Trimmer UI...</h2>
+          <p id="boot-status" class="text-sm text-slate-400">
+            Initializing React application...
+          </p>
+        </div>
+      </div>
+    </div>
 
+    <!-- X-Ray Diagnostic Script: Agar koi error aaye toh black screen ki jagah screen par dikhao -->
+    <script>
+      window.addEventListener("error", function (event) {
+        var statusEl = document.getElementById("boot-status");
+        if (statusEl) {
+          statusEl.className = "text-sm text-rose-400 font-mono mt-2 break-all";
+          statusEl.innerText = "Error: " + (event.message || "Failed to load script. Check src/ folder files and Render Publish Directory (dist).");
+        }
+      }, true);
+    </script>
+
+    <!-- Entry Point pointing to /src/main.jsx -->
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
