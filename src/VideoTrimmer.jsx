@@ -1,10 +1,10 @@
 import React, { useState, useRef, useEffect } from "react";
 import { processVideoCuts } from "./processVideoCuts.js";
 
-const MAX_FILE_SIZE = 3 * 1024 * 1024 * 1024; // 3GB in Bytes
+const MAX_FILE_SIZE = 3 * 1024 * 1024 * 1024; // 3GB Limit
 const MAX_CUTS = 10;
 
-// Convert "MM:SS" string to total seconds
+// Convert "MM:SS" to total seconds
 const timeToSeconds = (timeStr) => {
   if (!timeStr || !timeStr.includes(":")) return 0;
   const parts = timeStr.split(":").map((part) => parseInt(part, 10) || 0);
@@ -15,7 +15,7 @@ const timeToSeconds = (timeStr) => {
   return 0;
 };
 
-// Convert total seconds back to "MM:SS" string
+// Convert total seconds to "MM:SS"
 const secondsToTime = (totalSeconds) => {
   const safeSeconds = Math.max(0, Math.floor(totalSeconds));
   const minutes = Math.floor(safeSeconds / 60);
@@ -23,13 +23,13 @@ const secondsToTime = (totalSeconds) => {
   return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
 };
 
-// Add seconds to a "MM:SS" timestamp
+// Add seconds to "MM:SS"
 const addSecondsToTime = (timeStr, secondsToAdd = 1) => {
   const currentSeconds = timeToSeconds(timeStr);
   return secondsToTime(currentSeconds + secondsToAdd);
 };
 
-// Extract YouTube Video ID if user pastes a YouTube link
+// Extract 11-char YouTube ID
 const extractYouTubeId = (url) => {
   const regExp =
     /^.*(youtu.be\/|v\/|u\/\w\/|embed\/|watch\?v=|&v=|shorts\/)([^#&?]*).*/;
@@ -37,22 +37,88 @@ const extractYouTubeId = (url) => {
   return match && match[2].length === 11 ? match[2] : null;
 };
 
+// Multi-Fallback CORS Proxy Fetcher for remote URLs
+async function fetchWithCorsFallback(targetUrl, onStatus) {
+  const proxyList = [
+    (u) => u, // 1. Try direct first
+    (u) => `https://corsproxy.io/?${encodeURIComponent(u)}`, // 2. CORSProxy.io
+    (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`, // 3. AllOrigins
+  ];
+
+  for (let i = 0; i < proxyList.length; i++) {
+    try {
+      if (onStatus && i > 0) {
+        onStatus(`Bypassing CORS via Proxy #${i}...`);
+      }
+      const proxiedUrl = proxyList[i](targetUrl);
+      const response = await fetch(proxiedUrl);
+      if (response.ok) {
+        const blob = await response.blob();
+        if (blob.size > 1000) {
+          return blob;
+        }
+      }
+    } catch {
+      // Continue to next proxy
+    }
+  }
+  throw new Error("All CORS proxies timed out for this link.");
+}
+
+// Resolve YouTube direct MP4 stream via public Piped/Invidious APIs
+async function resolveYouTubeMp4Stream(ytId, onStatus) {
+  const instances = [
+    `https://pipedapi.kavin.rocks/streams/${ytId}`,
+    `https://pipedapi.tokhmi.xyz/streams/${ytId}`,
+    `https://pipedapi.moomoo.me/streams/${ytId}`,
+    `https://api.piped.projectsegfau.lt/streams/${ytId}`,
+  ];
+
+  for (const apiUrl of instances) {
+    try {
+      if (onStatus) onStatus("Resolving direct MP4 stream from YouTube link...");
+      const res = await fetch(apiUrl);
+      if (!res.ok) continue;
+      const data = await res.json();
+      if (data && Array.isArray(data.videoStreams)) {
+        // Find a combined video+audio MP4 stream
+        const mp4Stream =
+          data.videoStreams.find(
+            (s) => s.format === "MPEG_4" && s.videoOnly === false
+          ) || data.videoStreams[0];
+        if (mp4Stream && mp4Stream.url) {
+          return mp4Stream.url;
+        }
+      }
+    } catch {
+      // Try next public instance
+    }
+  }
+  return null;
+}
+
 export default function VideoTrimmer() {
   const [videoFile, setVideoFile] = useState(null);
   const [videoUrl, setVideoUrl] = useState("");
   const [youtubeId, setYoutubeId] = useState(null);
-  const [videoDuration, setVideoDuration] = useState(600); // Default 10 mins (600s) before video loads
+  const [videoDuration, setVideoDuration] = useState(300); // Default 5 mins (300s)
+  const [onlineTitle, setOnlineTitle] = useState("");
 
-  // State for pasting external video or YouTube link
+  // Main Slider Range directly under the video player
+  const [masterStartSec, setMasterStartSec] = useState(0);
+  const [masterEndSec, setMasterEndSec] = useState(300);
+  const [selectedCutCount, setSelectedCutCount] = useState(1);
+
   const [urlInput, setUrlInput] = useState("");
+  const [autoCaptionEnabled, setAutoCaptionEnabled] = useState(true);
 
   const [cuts, setCuts] = useState([
     {
       id: "cut-1",
       startTime: "00:00",
       endTime: "05:00",
-      aspectRatio: "16:9",
-      overlayText: "",
+      aspectRatio: "9:16",
+      overlayText: "Part 1 (Pehla Cut)",
     },
   ]);
 
@@ -70,15 +136,57 @@ export default function VideoTrimmer() {
     };
   }, [videoUrl]);
 
-  // 1. Local File Upload Handler (Max 3GB)
+  // Helper: Generate N sequential cuts from Master Range with Auto-Numbering & Auto-Captions
+  const generateSequentialCuts = (
+    count,
+    rangeStartSec,
+    rangeEndSec,
+    baseTitle = onlineTitle
+  ) => {
+    const safeCount = Math.min(MAX_CUTS, Math.max(1, count));
+    const totalSpan = Math.max(safeCount * 2, rangeEndSec - rangeStartSec);
+    const segmentLength = Math.floor(totalSpan / safeCount);
+    const cleanTitle = baseTitle
+      ? baseTitle.replace(/[^\w\s|-]/g, "").slice(0, 28).trim()
+      : "";
+
+    const newCuts = [];
+    for (let i = 0; i < safeCount; i++) {
+      const partNum = i + 1;
+      // Smart Auto-Shift: Part 1 starts at 00:00, Part 2 starts at Part 1 End + 1s
+      const startSec =
+        i === 0
+          ? rangeStartSec
+          : rangeStartSec + i * segmentLength + 1;
+      const endSec =
+        i === safeCount - 1
+          ? rangeEndSec
+          : Math.max(startSec + 1, rangeStartSec + (i + 1) * segmentLength);
+
+      const autoCaption = autoCaptionEnabled
+        ? cleanTitle
+          ? `Part ${partNum}/${safeCount} - ${cleanTitle}`
+          : `Part ${partNum} of ${safeCount}`
+        : "";
+
+      newCuts.push({
+        id: `cut-${Date.now()}-${i}`,
+        startTime: secondsToTime(startSec),
+        endTime: secondsToTime(endSec),
+        aspectRatio: "9:16",
+        overlayText: autoCaption,
+      });
+    }
+    setCuts(newCuts);
+  };
+
+  // 1. Local File Upload (Max 3GB)
   const handleFileUpload = (event) => {
     const file = event.target.files?.[0];
     if (!file) return;
 
     if (file.size > MAX_FILE_SIZE) {
-      alert(
-        "File size exceeds the 3GB limit! Please select a video smaller than 3GB."
-      );
+      alert("File size exceeds 3GB limit! Please choose a file under 3GB.");
       event.target.value = "";
       return;
     }
@@ -87,19 +195,22 @@ export default function VideoTrimmer() {
       URL.revokeObjectURL(videoUrl);
     }
 
+    const cleanFileName = file.name.replace(/\.[^/.]+$/, "");
     const localPreviewUrl = URL.createObjectURL(file);
+
     setYoutubeId(null);
+    setOnlineTitle(cleanFileName);
     setVideoFile(file);
     setVideoUrl(localPreviewUrl);
     setExportedParts([]);
   };
 
-  // 2. Paste Video Link / YouTube URL Handler
-  const handleLoadUrl = (e) => {
+  // 2. Load Online URL / YouTube Link + Auto-Fetch Title for Auto-Caption
+  const handleLoadUrl = async (e) => {
     e.preventDefault();
     const trimmedUrl = urlInput.trim();
     if (!trimmedUrl) {
-      alert("Please paste a valid video or YouTube URL first!");
+      alert("Please paste a video link first!");
       return;
     }
 
@@ -107,51 +218,110 @@ export default function VideoTrimmer() {
       URL.revokeObjectURL(videoUrl);
     }
 
+    setExportedParts([]);
+    let fetchedTitle = "Online Video";
+
+    // Auto-fetch video title from noembed (CORS-free API) for Auto-Captions
+    try {
+      const oembedRes = await fetch(
+        `https://noembed.com/embed?url=${encodeURIComponent(trimmedUrl)}`
+      );
+      if (oembedRes.ok) {
+        const oembedData = await oembedRes.json();
+        if (oembedData.title) {
+          fetchedTitle = oembedData.title;
+        }
+      }
+    } catch {
+      // Fallback if metadata not found
+    }
+
+    setOnlineTitle(fetchedTitle);
+
     const ytId = extractYouTubeId(trimmedUrl);
     if (ytId) {
-      // YouTube URL detected
       setYoutubeId(ytId);
-      setVideoUrl("");
-      setVideoFile({ name: `YouTube_${ytId}.mp4`, isYouTube: true });
-      setVideoDuration(900); // Default 15 mins slider range for YouTube preview
-      setExportedParts([]);
+      setVideoDuration(600);
+      setMasterStartSec(0);
+      setMasterEndSec(300);
+      setVideoFile({
+        name: `${fetchedTitle}.mp4`,
+        isYouTube: true,
+        ytId: ytId,
+        originalUrl: trimmedUrl,
+      });
+
+      // Auto-populate cuts with fetched online title
+      generateSequentialCuts(selectedCutCount, 0, 300, fetchedTitle);
+
+      // Try resolving direct MP4 stream in background so native player works
+      const resolvedStream = await resolveYouTubeMp4Stream(ytId);
+      if (resolvedStream) {
+        setVideoUrl(`https://corsproxy.io/?${encodeURIComponent(resolvedStream)}`);
+        setYoutubeId(null); // Switch to native video player if stream resolved!
+      }
       return;
     }
 
-    // Direct Video URL (.mp4, .webm, R2 link, etc.)
+    // Direct Video URL (.mp4, R2 link, etc.) wrapped with CORS support
     setYoutubeId(null);
     setVideoUrl(trimmedUrl);
     setVideoFile({
       name:
-        trimmedUrl.split("/").pop().split("?")[0] || "remote_video_stream.mp4",
+        trimmedUrl.split("/").pop().split("?")[0] || "online_video.mp4",
       isRemoteUrl: true,
       url: trimmedUrl,
     });
-    setExportedParts([]);
+    generateSequentialCuts(selectedCutCount, 0, 300, fetchedTitle);
   };
 
-  // Capture exact video duration when metadata loads
+  // Update duration when video loads in player
   const handleLoadedMetadata = () => {
     if (videoRef.current && videoRef.current.duration) {
       const actualDuration = Math.floor(videoRef.current.duration);
       if (actualDuration > 0 && Number.isFinite(actualDuration)) {
         setVideoDuration(actualDuration);
-        // Clamp Part 1 endTime if video is shorter than 05:00
-        setCuts((prevCuts) =>
-          prevCuts.map((c, idx) =>
-            idx === 0 && timeToSeconds(c.endTime) > actualDuration
-              ? { ...c, endTime: secondsToTime(actualDuration) }
-              : c
-          )
+        setMasterStartSec(0);
+        setMasterEndSec(actualDuration);
+        generateSequentialCuts(
+          selectedCutCount,
+          0,
+          actualDuration,
+          onlineTitle
         );
       }
     }
   };
 
-  // Add New Cut with +1s Smart Auto-Shift
+  // Master Slider Change (Directly below video player)
+  const handleMasterSlider = (type, rawVal) => {
+    const sec = parseInt(rawVal, 10) || 0;
+    let newStart = masterStartSec;
+    let newEnd = masterEndSec;
+
+    if (type === "start") {
+      newStart = Math.min(sec, Math.max(0, masterEndSec - 2));
+      setMasterStartSec(newStart);
+      if (videoRef.current) videoRef.current.currentTime = newStart;
+    } else {
+      newEnd = Math.max(sec, masterStartSec + 2);
+      setMasterEndSec(newEnd);
+      if (videoRef.current) videoRef.current.currentTime = newEnd;
+    }
+
+    generateSequentialCuts(selectedCutCount, newStart, newEnd, onlineTitle);
+  };
+
+  // Quick Selector: Choose How Many Cuts (1 to 10) at once
+  const handleSelectCutCount = (count) => {
+    setSelectedCutCount(count);
+    generateSequentialCuts(count, masterStartSec, masterEndSec, onlineTitle);
+  };
+
+  // Manual "+ Add New Cut" with +1s Smart Auto-Shift
   const handleAddCut = () => {
     if (cuts.length >= MAX_CUTS) {
-      alert("Maximum 10 cuts are allowed!");
+      alert("Maximum 10 cuts allowed!");
       return;
     }
 
@@ -160,19 +330,29 @@ export default function VideoTrimmer() {
       ? Math.min(timeToSeconds(lastCut.endTime) + 1, videoDuration - 1)
       : 0;
     const nextEndSec = Math.min(nextStartSec + 60, videoDuration);
+    const newTotal = cuts.length + 1;
+    const cleanTitle = onlineTitle
+      ? onlineTitle.replace(/[^\w\s|-]/g, "").slice(0, 28).trim()
+      : "";
 
     const newCut = {
       id: `cut-${Date.now()}-${Math.random()}`,
       startTime: secondsToTime(nextStartSec),
       endTime: secondsToTime(nextEndSec),
-      aspectRatio: "16:9",
-      overlayText: "",
+      aspectRatio: "9:16",
+      overlayText: autoCaptionEnabled
+        ? cleanTitle
+          ? `Part ${newTotal} - ${cleanTitle}`
+          : `Part ${newTotal}`
+        : "",
     };
 
-    setCuts((prevCuts) => [...prevCuts, newCut]);
+    const updated = [...cuts, newCut];
+    setCuts(updated);
+    setSelectedCutCount(updated.length);
   };
 
-  // Update Cut via Text Input + Trigger Smart Auto-Shift
+  // Edit Individual Cut Input
   const handleCutChange = (index, field, value) => {
     setCuts((prevCuts) => {
       const updatedCuts = [...prevCuts];
@@ -181,94 +361,28 @@ export default function VideoTrimmer() {
         [field]: value,
       };
 
-      // Smart Auto-Shift: Update next cut's startTime to current endTime + 1s
+      // Smart Auto-Shift (+1s) for next part
       if (field === "endTime" && index + 1 < updatedCuts.length) {
         updatedCuts[index + 1] = {
           ...updatedCuts[index + 1],
           startTime: addSecondsToTime(value, 1),
         };
       }
-
-      return updatedCuts;
-    });
-  };
-
-  // Update Cut via Interactive Slider + Seek Video Player Live
-  const handleSliderChange = (index, type, rawSeconds) => {
-    const secValue = parseInt(rawSeconds, 10) || 0;
-
-    setCuts((prevCuts) => {
-      const updatedCuts = [...prevCuts];
-      const currentCut = updatedCuts[index];
-      const currentStartSec = timeToSeconds(currentCut.startTime);
-      const currentEndSec = timeToSeconds(currentCut.endTime);
-
-      if (type === "start") {
-        // Ensure start time does not cross end time
-        const clampedStart = Math.min(secValue, Math.max(0, currentEndSec - 1));
-        updatedCuts[index] = {
-          ...currentCut,
-          startTime: secondsToTime(clampedStart),
-        };
-        if (videoRef.current) {
-          videoRef.current.currentTime = clampedStart;
-        }
-      } else if (type === "end") {
-        // Ensure end time is at least 1 second after start time
-        const clampedEnd = Math.max(secValue, currentStartSec + 1);
-        const formattedEnd = secondsToTime(clampedEnd);
-        updatedCuts[index] = {
-          ...currentCut,
-          endTime: formattedEnd,
-        };
-        if (videoRef.current) {
-          videoRef.current.currentTime = clampedEnd;
-        }
-
-        // Smart Auto-Shift for the next Part
-        if (index + 1 < updatedCuts.length) {
-          const nextStartSec = Math.min(clampedEnd + 1, videoDuration);
-          const nextEndSec = Math.max(
-            timeToSeconds(updatedCuts[index + 1].endTime),
-            nextStartSec + 1
-          );
-          updatedCuts[index + 1] = {
-            ...updatedCuts[index + 1],
-            startTime: secondsToTime(nextStartSec),
-            endTime: secondsToTime(Math.min(nextEndSec, videoDuration)),
-          };
-        }
-      }
-
       return updatedCuts;
     });
   };
 
   const handleRemoveCut = (idToRemove) => {
-    if (cuts.length <= 1) {
-      alert("At least 1 cut is required.");
-      return;
-    }
-    setCuts((prevCuts) => prevCuts.filter((cut) => cut.id !== idToRemove));
+    if (cuts.length <= 1) return;
+    const filtered = cuts.filter((c) => c.id !== idToRemove);
+    setCuts(filtered);
+    setSelectedCutCount(filtered.length);
   };
 
-  const jumpToCutStart = (startTimeStr) => {
-    if (!videoRef.current) return;
-    videoRef.current.currentTime = timeToSeconds(startTimeStr);
-    videoRef.current.play();
-  };
-
-  // Export All Cuts with FFmpeg.wasm
+  // Export All Cuts with Automatic CORS Proxy & YouTube Stream Fallback
   const handleExportAllCuts = async () => {
     if (!videoFile && !videoUrl) {
-      alert("Please upload a video or paste a video link first!");
-      return;
-    }
-
-    if (videoFile?.isYouTube) {
-      alert(
-        "YouTube links block direct browser downloading due to CORS policy. For FFmpeg export, please paste a direct .mp4 link or upload the video file from your device."
-      );
+      alert("Pehle koi video file upload karein ya link load karein!");
       return;
     }
 
@@ -277,14 +391,34 @@ export default function VideoTrimmer() {
       setExportedParts([]);
 
       let sourceToProcess = videoFile;
-      if (videoFile?.isRemoteUrl) {
-        setProgressText("Fetching remote video from URL...");
-        const response = await fetch(videoFile.url);
-        if (!response.ok) {
-          throw new Error("Could not fetch video from URL (CORS blocked).");
+
+      // Case 1: If it's a YouTube link, resolve direct MP4 stream + fetch via CORS proxy
+      if (videoFile?.isYouTube) {
+        const streamUrl = await resolveYouTubeMp4Stream(
+          videoFile.ytId,
+          (msg) => setProgressText(msg)
+        );
+
+        if (!streamUrl) {
+          throw new Error(
+            "YouTube security blocked direct stream extraction on this network. Tip: Upload the downloaded MP4 file from your device for instant 3GB trimming!"
+          );
         }
-        const blob = await response.blob();
-        sourceToProcess = new File([blob], videoFile.name || "remote.mp4", {
+
+        const blob = await fetchWithCorsFallback(streamUrl, (msg) =>
+          setProgressText(msg)
+        );
+        sourceToProcess = new File([blob], videoFile.name || "youtube.mp4", {
+          type: "video/mp4",
+        });
+      }
+      // Case 2: If it's a remote URL (.mp4 link), fetch through Multi-CORS Proxy
+      else if (videoFile?.isRemoteUrl) {
+        setProgressText("Downloading online video via CORS Proxy...");
+        const blob = await fetchWithCorsFallback(videoFile.url, (msg) =>
+          setProgressText(msg)
+        );
+        sourceToProcess = new File([blob], videoFile.name || "online.mp4", {
           type: blob.type || "video/mp4",
         });
       }
@@ -298,32 +432,42 @@ export default function VideoTrimmer() {
       );
       setExportedParts(results);
     } catch (error) {
-      alert(
-        error.message || "Something went wrong while trimming the video."
-      );
+      alert(error.message || "Error while processing cuts.");
     } finally {
       setIsProcessing(false);
       setProgressText("");
     }
   };
 
+  const masterLeftPercent = Math.min(
+    100,
+    Math.max(0, (masterStartSec / Math.max(1, videoDuration)) * 100)
+  );
+  const masterWidthPercent = Math.min(
+    100 - masterLeftPercent,
+    Math.max(
+      2,
+      ((masterEndSec - masterStartSec) / Math.max(1, videoDuration)) * 100
+    )
+  );
+
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 p-6">
-      {/* Top Header + URL Paste Bar + File Upload */}
+    <div className="min-h-screen bg-slate-950 text-slate-100 p-4 sm:p-6">
+      {/* Top Bar: Upload + Online Link Input */}
       <header className="max-w-7xl mx-auto mb-6 border-b border-slate-800 pb-5 space-y-4">
-        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
           <div>
             <h1 className="text-2xl font-bold text-white">
-              Client-Side Video Trimmer
+              Smart Video Trimmer & Multi-Cut Maker
             </h1>
-            <p className="text-sm text-slate-400">
-              Zero-server upload • Visual Cut Slider • Direct URL & Local File
-              Support (Max 3GB)
+            <p className="text-xs sm:text-sm text-slate-400">
+              Slide under video to cut • Choose 1 to 10 Parts • Auto-Numbering
+              & Auto-Caption
             </p>
           </div>
 
-          <label className="cursor-pointer bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2.5 rounded-lg font-semibold text-sm transition inline-block text-center shrink-0">
-            Upload Video from Device (Max 3GB)
+          <label className="cursor-pointer bg-indigo-600 hover:bg-indigo-500 text-white px-5 py-2.5 rounded-lg font-semibold text-sm transition text-center shadow-lg shadow-indigo-600/20">
+            Upload Video (Max 3GB)
             <input
               type="file"
               accept="video/*"
@@ -333,17 +477,17 @@ export default function VideoTrimmer() {
           </label>
         </div>
 
-        {/* Dedicated Video / YouTube Link Paste Bar */}
+        {/* Paste Online Video Link Bar */}
         <form
           onSubmit={handleLoadUrl}
-          className="bg-slate-900 border border-slate-800 rounded-xl p-3 flex flex-col sm:flex-row items-stretch sm:items-center gap-3"
+          className="bg-slate-900 border border-slate-800 rounded-xl p-2.5 flex flex-col sm:flex-row items-stretch sm:items-center gap-2.5"
         >
-          <span className="text-xs font-semibold text-indigo-400 uppercase tracking-wider px-2 shrink-0">
-            Paste Video Link:
+          <span className="text-xs font-bold text-indigo-400 uppercase px-2 shrink-0">
+            Online Video Link:
           </span>
           <input
             type="url"
-            placeholder="Paste YouTube URL or direct .mp4 / R2 video link here..."
+            placeholder="Paste direct .mp4 link or video URL here..."
             value={urlInput}
             onChange={(e) => setUrlInput(e.target.value)}
             className="flex-1 bg-slate-950 border border-slate-700 rounded-lg px-3.5 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500"
@@ -352,82 +496,155 @@ export default function VideoTrimmer() {
             type="submit"
             className="bg-emerald-600 hover:bg-emerald-500 text-white px-5 py-2 rounded-lg text-sm font-semibold transition shrink-0"
           >
-            Load Link
+            Load Video & Auto-Caption
           </button>
         </form>
       </header>
 
-      {/* Main Two-Column Dashboard */}
+      {/* Main Two-Column Layout */}
       <main className="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-12 gap-6">
-        {/* LEFT COLUMN: Original Video / YouTube Preview */}
-        <section className="lg:col-span-5 bg-slate-900 border border-slate-800 rounded-xl p-4 flex flex-col justify-between h-fit lg:sticky lg:top-6">
-          <div className="mb-3 flex items-center justify-between">
-            <h2 className="text-base font-semibold text-slate-200">
-              Original Video Preview
+        {/* LEFT COLUMN: Video Preview + Direct Cut Slider + 1-10 Cut Selector */}
+        <section className="lg:col-span-6 bg-slate-900 border border-slate-800 rounded-xl p-4 flex flex-col gap-4 h-fit lg:sticky lg:top-6">
+          <div className="flex items-center justify-between">
+            <h2 className="text-base font-bold text-white">
+              1. Video Preview & Cut Slider
             </h2>
-            {videoFile && (
-              <span className="text-xs bg-slate-800 text-slate-300 px-2.5 py-1 rounded-md">
-                {videoFile.size
-                  ? `${(videoFile.size / (1024 * 1024)).toFixed(1)} MB`
-                  : videoFile.isYouTube
-                  ? "YouTube Preview"
-                  : "Direct URL"}
+            {onlineTitle && (
+              <span className="text-xs bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 px-2.5 py-1 rounded-md truncate max-w-[55%]">
+                {onlineTitle}
               </span>
             )}
           </div>
 
+          {/* Video Player Box */}
           {youtubeId ? (
-            <div className="space-y-3">
-              <iframe
-                src={`https://www.youtube.com/embed/${youtubeId}`}
-                title="YouTube video player"
-                className="w-full rounded-lg bg-black aspect-video border border-slate-800"
-                allowFullScreen
-              />
-              <div className="text-xs text-amber-300 bg-amber-950/40 border border-amber-500/30 p-2.5 rounded-lg">
-                YouTube preview loaded! Use the sliders on the right to plan
-                your cuts. (For direct MP4 trimming inside the browser, use a
-                direct .mp4 link or upload a local file).
-              </div>
-            </div>
+            <iframe
+              src={`https://www.youtube.com/embed/${youtubeId}`}
+              title="YouTube Preview"
+              className="w-full rounded-lg bg-black aspect-video border border-slate-800"
+              allowFullScreen
+            />
           ) : videoUrl ? (
-            <div className="space-y-3">
-              <video
-                ref={videoRef}
-                src={videoUrl}
-                controls
-                crossOrigin="anonymous"
-                onLoadedMetadata={handleLoadedMetadata}
-                className="w-full rounded-lg bg-black aspect-video object-contain border border-slate-800"
-              />
-              <div className="flex items-center justify-between text-xs text-slate-400 bg-slate-950/60 p-2.5 rounded-lg">
-                <span className="truncate max-w-[65%] font-medium text-slate-300">
-                  {videoFile?.name}
-                </span>
-                <span>Total Length: {secondsToTime(videoDuration)}</span>
-              </div>
-            </div>
+            <video
+              ref={videoRef}
+              src={videoUrl}
+              controls
+              crossOrigin="anonymous"
+              onLoadedMetadata={handleLoadedMetadata}
+              className="w-full rounded-lg bg-black aspect-video object-contain border border-slate-800"
+            />
           ) : (
-            <div className="aspect-video rounded-lg border-2 border-dashed border-slate-800 flex flex-col items-center justify-center p-6 text-center bg-slate-950/40">
-              <p className="text-slate-400 text-sm font-medium mb-1">
-                No video selected yet
+            <div className="aspect-video rounded-lg border-2 border-dashed border-slate-800 flex flex-col items-center justify-center p-6 text-center bg-slate-950/50">
+              <p className="text-slate-300 text-sm font-semibold mb-1">
+                Koi Video Select Nahi Hai
               </p>
               <p className="text-slate-500 text-xs">
-                Upload a video (up to 3GB) or paste a link in the bar above.
+                Upar button se video upload karein ya link paste karein. Jaise
+                hi video aayegi, neeche slider se cut select karein!
               </p>
             </div>
           )}
+
+          {/* DIRECT SLIDER RIGHT UNDER THE VIDEO */}
+          <div className="bg-slate-950 border border-slate-800 rounded-xl p-4 space-y-4">
+            <div className="flex items-center justify-between text-xs">
+              <span className="text-slate-300 font-semibold">
+                Slide to Select Cut Range:
+              </span>
+              <span className="font-mono text-emerald-400 font-bold">
+                {secondsToTime(masterStartSec)} to {secondsToTime(masterEndSec)}{" "}
+                ({Math.max(0, masterEndSec - masterStartSec)}s selected)
+              </span>
+            </div>
+
+            {/* Visual Highlight Bar */}
+            <div className="relative h-3 bg-slate-800 rounded-full overflow-hidden">
+              <div
+                className="absolute top-0 bottom-0 bg-gradient-to-r from-indigo-500 to-emerald-500 rounded-full"
+                style={{
+                  left: `${masterLeftPercent}%`,
+                  width: `${masterWidthPercent}%`,
+                }}
+              />
+            </div>
+
+            {/* Start & End Range Sliders Directly Under Video */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <label className="block text-[11px] text-slate-400 mb-1">
+                  Start Point:{" "}
+                  <strong className="text-indigo-400">
+                    {secondsToTime(masterStartSec)}
+                  </strong>
+                </label>
+                <input
+                  type="range"
+                  min="0"
+                  max={videoDuration}
+                  value={masterStartSec}
+                  onChange={(e) => handleMasterSlider("start", e.target.value)}
+                  className="w-full accent-indigo-500 cursor-pointer"
+                />
+              </div>
+
+              <div>
+                <label className="block text-[11px] text-slate-400 mb-1">
+                  End Point:{" "}
+                  <strong className="text-emerald-400">
+                    {secondsToTime(masterEndSec)}
+                  </strong>
+                </label>
+                <input
+                  type="range"
+                  min="0"
+                  max={videoDuration}
+                  value={masterEndSec}
+                  onChange={(e) => handleMasterSlider("end", e.target.value)}
+                  className="w-full accent-emerald-500 cursor-pointer"
+                />
+              </div>
+            </div>
+
+            {/* SIMPLE NUMBER PICKER: Ek Baar Mein Kitne Cut Chahiye (1 to 10) */}
+            <div className="pt-3 border-t border-slate-800/80">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-xs font-semibold text-slate-200">
+                  Ek baar mein kitne Cut chahiye? (Choose 1 to 10):
+                </span>
+                <span className="text-xs text-indigo-400 font-bold">
+                  {selectedCutCount} {selectedCutCount === 1 ? "Cut" : "Cuts"}
+                </span>
+              </div>
+
+              <div className="grid grid-cols-5 sm:grid-cols-10 gap-1.5">
+                {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((num) => (
+                  <button
+                    key={num}
+                    type="button"
+                    onClick={() => handleSelectCutCount(num)}
+                    className={`py-2 rounded-lg text-xs font-bold transition border ${
+                      selectedCutCount === num
+                        ? "bg-indigo-600 text-white border-indigo-400 shadow-md shadow-indigo-600/30"
+                        : "bg-slate-900 text-slate-400 border-slate-800 hover:bg-slate-800 hover:text-white"
+                    }`}
+                  >
+                    {num}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
         </section>
 
-        {/* RIGHT COLUMN: Cuts Manager with Interactive Sliders */}
-        <section className="lg:col-span-7 bg-slate-900 border border-slate-800 rounded-xl p-4 flex flex-col">
+        {/* RIGHT COLUMN: Numbered Parts List + Auto-Captions + Export */}
+        <section className="lg:col-span-6 bg-slate-900 border border-slate-800 rounded-xl p-4 flex flex-col">
           <div className="flex flex-wrap items-center justify-between gap-2 mb-4 pb-3 border-b border-slate-800">
             <div>
-              <h2 className="text-base font-semibold text-slate-200">
-                Trim Segments ({cuts.length} / {MAX_CUTS})
+              <h2 className="text-base font-bold text-white">
+                2. Ordered Cut Parts ({cuts.length} / {MAX_CUTS})
               </h2>
               <p className="text-xs text-slate-400">
-                Slide handles or type MM:SS • Auto-shifts next cut by +1s
+                Har part par number aur auto-caption apne-aap lag gaya hai
               </p>
             </div>
 
@@ -436,216 +653,162 @@ export default function VideoTrimmer() {
                 type="button"
                 onClick={handleAddCut}
                 disabled={cuts.length >= MAX_CUTS || isProcessing}
-                className={`px-3.5 py-2 rounded-lg text-sm font-semibold transition ${
-                  cuts.length >= MAX_CUTS || isProcessing
-                    ? "bg-slate-800 text-slate-500 cursor-not-allowed"
-                    : "bg-emerald-600 hover:bg-emerald-500 text-white"
-                }`}
+                className="px-3 py-2 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 transition disabled:opacity-40"
               >
-                + Add New Cut
+                + 1 More Cut
               </button>
 
               <button
                 type="button"
                 onClick={handleExportAllCuts}
                 disabled={(!videoFile && !videoUrl) || isProcessing}
-                className={`px-4 py-2 rounded-lg text-sm font-semibold transition ${
+                className={`px-4 py-2 rounded-lg text-xs font-bold transition ${
                   (!videoFile && !videoUrl) || isProcessing
                     ? "bg-slate-800 text-slate-500 cursor-not-allowed"
-                    : "bg-indigo-600 hover:bg-indigo-500 text-white"
+                    : "bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg shadow-emerald-600/20"
                 }`}
               >
-                {isProcessing ? "Processing..." : "Export All Cuts"}
+                {isProcessing
+                  ? "Cutting Video..."
+                  : `Cut & Download (${cuts.length} Parts)`}
               </button>
             </div>
           </div>
 
+          {/* Auto-Caption Toggle Bar */}
+          <div className="mb-3 flex items-center justify-between bg-slate-950 border border-slate-800 px-3.5 py-2 rounded-lg">
+            <label className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={autoCaptionEnabled}
+                onChange={(e) => {
+                  const checked = e.target.checked;
+                  setAutoCaptionEnabled(checked);
+                  setCuts((prev) =>
+                    prev.map((c, idx) => ({
+                      ...c,
+                      overlayText: checked
+                        ? onlineTitle
+                          ? `Part ${idx + 1}/${prev.length} - ${onlineTitle.slice(0, 25)}`
+                          : `Part ${idx + 1} of ${prev.length}`
+                        : "",
+                    }))
+                  );
+                }}
+                className="accent-indigo-500 rounded"
+              />
+              <span>
+                Auto-add <strong>Part Number + Video Caption</strong> on every
+                cut
+              </span>
+            </label>
+          </div>
+
           {isProcessing && (
-            <div className="mb-4 bg-indigo-950/60 border border-indigo-500/40 text-indigo-300 px-4 py-3 rounded-lg text-sm font-medium animate-pulse">
+            <div className="mb-4 bg-indigo-950/70 border border-indigo-500/40 text-indigo-300 px-4 py-3 rounded-lg text-xs font-semibold animate-pulse">
               {progressText || "Processing video cuts..."}
             </div>
           )}
 
-          {/* Scrollable List of Cuts */}
-          <div className="space-y-4 max-h-[65vh] overflow-y-auto pr-1">
+          {/* Ordered Parts List */}
+          <div className="space-y-3 max-h-[58vh] overflow-y-auto pr-1">
             {cuts.map((cut, index) => {
-              const startSec = timeToSeconds(cut.startTime);
-              const endSec = timeToSeconds(cut.endTime);
-              const maxSec = Math.max(videoDuration, endSec + 60, 60);
-              const leftPercent = Math.min(
-                100,
-                Math.max(0, (startSec / maxSec) * 100)
-              );
-              const widthPercent = Math.min(
-                100 - leftPercent,
-                Math.max(1, ((endSec - startSec) / maxSec) * 100)
-              );
+              const orderLabel =
+                index === 0
+                  ? "Pehla Cut (1st)"
+                  : index === cuts.length - 1 && cuts.length > 1
+                  ? `Aakhri Cut (${index + 1}th)`
+                  : `Agla Cut (${index + 1}nd)`;
 
               return (
                 <div
                   key={cut.id}
-                  className="bg-slate-950 border border-slate-800 rounded-lg p-4 transition hover:border-slate-700"
+                  className="bg-slate-950 border border-slate-800 rounded-lg p-3.5 hover:border-slate-700 transition"
                 >
-                  {/* Top Bar of Part Card */}
-                  <div className="flex items-center justify-between mb-3">
+                  <div className="flex items-center justify-between mb-2.5">
                     <div className="flex items-center gap-2">
-                      <span className="bg-indigo-600/20 text-indigo-400 border border-indigo-500/30 text-xs font-bold px-2.5 py-1 rounded">
+                      <span className="bg-indigo-600 text-white text-xs font-bold px-2.5 py-0.5 rounded">
                         Part {index + 1}
                       </span>
-                      <span className="text-xs text-slate-300 font-mono">
-                        {cut.startTime} → {cut.endTime} (
-                        {Math.max(0, endSec - startSec)}s)
+                      <span className="text-[11px] bg-slate-900 text-amber-400 border border-amber-500/20 px-2 py-0.5 rounded font-medium">
+                        #{index + 1} • {orderLabel}
+                      </span>
+                      <span className="text-xs text-slate-400 font-mono">
+                        ({cut.startTime} → {cut.endTime})
                       </span>
                     </div>
 
-                    <div className="flex items-center gap-3">
-                      {videoUrl && (
-                        <button
-                          type="button"
-                          onClick={() => jumpToCutStart(cut.startTime)}
-                          className="text-xs text-indigo-400 hover:text-indigo-300 font-medium"
-                        >
-                          Preview Start
-                        </button>
-                      )}
-                      {cuts.length > 1 && (
-                        <button
-                          type="button"
-                          onClick={() => handleRemoveCut(cut.id)}
-                          className="text-xs text-rose-400 hover:text-rose-300 font-medium"
-                        >
-                          Remove
-                        </button>
-                      )}
-                    </div>
+                    {cuts.length > 1 && (
+                      <button
+                        type="button"
+                        onClick={() => handleRemoveCut(cut.id)}
+                        className="text-xs text-rose-400 hover:text-rose-300"
+                      >
+                        Remove
+                      </button>
+                    )}
                   </div>
 
-                  {/* Interactive Visual Range Slider for Start & End Selection */}
-                  <div className="mb-4 bg-slate-900/90 border border-slate-800/80 rounded-lg p-3">
-                    <div className="flex justify-between text-[11px] text-slate-400 mb-1.5">
-                      <span>
-                        Slide Start:{" "}
-                        <strong className="text-indigo-400">
-                          {cut.startTime}
-                        </strong>
-                      </span>
-                      <span>
-                        Slide End:{" "}
-                        <strong className="text-emerald-400">
-                          {cut.endTime}
-                        </strong>
-                      </span>
-                    </div>
-
-                    {/* Highlighted Visual Timeline Bar */}
-                    <div className="relative h-2.5 bg-slate-800 rounded-full overflow-hidden mb-3">
-                      <div
-                        className="absolute top-0 bottom-0 bg-gradient-to-r from-indigo-500 to-emerald-500 rounded-full"
-                        style={{
-                          left: `${leftPercent}%`,
-                          width: `${widthPercent}%`,
-                        }}
-                      />
-                    </div>
-
-                    {/* Dual Sliders for Smooth Dragging */}
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                      <div className="flex items-center gap-2">
-                        <span className="text-[11px] text-slate-400 w-10">
-                          Start:
-                        </span>
-                        <input
-                          type="range"
-                          min="0"
-                          max={maxSec}
-                          value={startSec}
-                          onChange={(e) =>
-                            handleSliderChange(index, "start", e.target.value)
-                          }
-                          className="w-full accent-indigo-500 cursor-pointer h-1.5 bg-slate-800 rounded-lg"
-                        />
-                      </div>
-
-                      <div className="flex items-center gap-2">
-                        <span className="text-[11px] text-slate-400 w-10">
-                          End:
-                        </span>
-                        <input
-                          type="range"
-                          min="0"
-                          max={maxSec}
-                          value={endSec}
-                          onChange={(e) =>
-                            handleSliderChange(index, "end", e.target.value)
-                          }
-                          className="w-full accent-emerald-500 cursor-pointer h-1.5 bg-slate-800 rounded-lg"
-                        />
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Manual Input Fields: Start Time, End Time, Aspect Ratio, Text */}
-                  <div className="grid grid-cols-1 sm:grid-cols-12 gap-3">
-                    <div className="sm:col-span-3">
-                      <label className="block text-xs text-slate-400 mb-1">
-                        Start Time (MM:SS)
+                  {/* Inputs for Start, End, Ratio, Auto-Caption */}
+                  <div className="grid grid-cols-2 sm:grid-cols-12 gap-2.5">
+                    <div className="sm:col-span-2">
+                      <label className="block text-[10px] text-slate-400 mb-1">
+                        Start
                       </label>
                       <input
                         type="text"
-                        placeholder="00:00"
                         value={cut.startTime}
                         onChange={(e) =>
                           handleCutChange(index, "startTime", e.target.value)
                         }
-                        className="w-full bg-slate-900 border border-slate-700 rounded-md px-3 py-1.5 text-sm text-white focus:outline-none focus:border-indigo-500"
+                        className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-white font-mono"
                       />
                     </div>
 
-                    <div className="sm:col-span-3">
-                      <label className="block text-xs text-slate-400 mb-1">
-                        End Time (MM:SS)
+                    <div className="sm:col-span-2">
+                      <label className="block text-[10px] text-slate-400 mb-1">
+                        End
                       </label>
                       <input
                         type="text"
-                        placeholder="05:00"
                         value={cut.endTime}
                         onChange={(e) =>
                           handleCutChange(index, "endTime", e.target.value)
                         }
-                        className="w-full bg-slate-900 border border-slate-700 rounded-md px-3 py-1.5 text-sm text-white focus:outline-none focus:border-indigo-500"
+                        className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-white font-mono"
                       />
                     </div>
 
                     <div className="sm:col-span-3">
-                      <label className="block text-xs text-slate-400 mb-1">
-                        Aspect Ratio
+                      <label className="block text-[10px] text-slate-400 mb-1">
+                        Size / Ratio
                       </label>
                       <select
                         value={cut.aspectRatio}
                         onChange={(e) =>
                           handleCutChange(index, "aspectRatio", e.target.value)
                         }
-                        className="w-full bg-slate-900 border border-slate-700 rounded-md px-2.5 py-1.5 text-sm text-white focus:outline-none focus:border-indigo-500"
+                        className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-white"
                       >
-                        <option value="16:9">16:9 (Landscape)</option>
                         <option value="9:16">9:16 (Reels/Shorts)</option>
                         <option value="1:1">1:1 (Square)</option>
+                        <option value="16:9">16:9 (Original)</option>
                         <option value="4:5">4:5 (Portrait)</option>
                       </select>
                     </div>
 
-                    <div className="sm:col-span-3">
-                      <label className="block text-xs text-slate-400 mb-1">
-                        Part Text / Caption
+                    <div className="col-span-2 sm:col-span-5">
+                      <label className="block text-[10px] text-slate-400 mb-1">
+                        Auto-Caption on Video (Part #{index + 1})
                       </label>
                       <input
                         type="text"
-                        placeholder="Enter caption..."
+                        placeholder="Auto caption..."
                         value={cut.overlayText}
                         onChange={(e) =>
                           handleCutChange(index, "overlayText", e.target.value)
                         }
-                        className="w-full bg-slate-900 border border-slate-700 rounded-md px-3 py-1.5 text-sm text-white focus:outline-none focus:border-indigo-500"
+                        className="w-full bg-slate-900 border border-slate-700 rounded px-2.5 py-1 text-xs text-emerald-300"
                       />
                     </div>
                   </div>
@@ -654,32 +817,36 @@ export default function VideoTrimmer() {
             })}
           </div>
 
-          {/* Exported Downloadable Clips Section */}
+          {/* Ready to Download Section (Sequentially Numbered) */}
           {exportedParts.length > 0 && (
-            <div className="mt-6 pt-4 border-t border-slate-800">
-              <h3 className="text-sm font-semibold text-emerald-400 mb-3">
-                Ready to Save ({exportedParts.length} Clips)
+            <div className="mt-5 pt-4 border-t border-slate-800">
+              <h3 className="text-sm font-bold text-emerald-400 mb-3">
+                Download Numbered Cuts (Order Wise: 1st to {exportedParts.length}
+                th)
               </h3>
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                {exportedParts.map((item) => (
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                {exportedParts.map((item, idx) => (
                   <div
                     key={item.id}
-                    className="bg-slate-950 border border-emerald-500/30 rounded-lg p-3 flex items-center justify-between"
+                    className="bg-slate-950 border border-emerald-500/40 rounded-lg p-3 flex items-center justify-between"
                   >
                     <div>
-                      <p className="text-sm font-bold text-white">
+                      <span className="text-[10px] bg-emerald-500/20 text-emerald-300 px-2 py-0.5 rounded font-bold">
+                        #{idx + 1} Cut
+                      </span>
+                      <p className="text-sm font-bold text-white mt-1">
                         {item.partLabel} ({item.aspectRatio})
                       </p>
-                      <p className="text-xs text-slate-400">
-                        {item.startTime} to {item.endTime}
+                      <p className="text-[11px] text-slate-400">
+                        {item.startTime} → {item.endTime}
                       </p>
                     </div>
                     <a
                       href={item.downloadUrl}
-                      download={item.fileName}
-                      className="bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold px-3 py-2 rounded-md transition"
+                      download={`0${idx + 1}_${item.fileName}`}
+                      className="bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold px-3.5 py-2 rounded-lg transition"
                     >
-                      Download MP4
+                      Save Part {idx + 1}
                     </a>
                   </div>
                 ))}
