@@ -37,63 +37,104 @@ const extractYouTubeId = (url) => {
   return match && match[2].length === 11 ? match[2] : null;
 };
 
-// Multi-Fallback CORS Proxy Fetcher for remote URLs
+// Multi-Fallback CORS Proxy Fetcher
 async function fetchWithCorsFallback(targetUrl, onStatus) {
   const proxyList = [
-    (u) => u, // 1. Try direct first
-    (u) => `https://corsproxy.io/?${encodeURIComponent(u)}`, // 2. CORSProxy.io
-    (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`, // 3. AllOrigins
+    (u) => u,
+    (u) => `https://corsproxy.io/?${encodeURIComponent(u)}`,
+    (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
   ];
 
   for (let i = 0; i < proxyList.length; i++) {
     try {
       if (onStatus && i > 0) {
-        onStatus(`Bypassing CORS via Proxy #${i}...`);
+        onStatus(`Trying CORS Bypass Tunnel #${i}...`);
       }
-      const proxiedUrl = proxyList[i](targetUrl);
-      const response = await fetch(proxiedUrl);
-      if (response.ok) {
-        const blob = await response.blob();
-        if (blob.size > 1000) {
+      const res = await fetch(proxyList[i](targetUrl));
+      if (res.ok) {
+        const blob = await res.blob();
+        // Verify we received real video bytes and not an HTML error page
+        if (blob.size > 50000) {
           return blob;
         }
       }
     } catch {
-      // Continue to next proxy
+      // Move to next proxy
     }
   }
-  throw new Error("All CORS proxies timed out for this link.");
+  throw new Error("CORS proxy tunnel failed.");
 }
 
-// Resolve YouTube direct MP4 stream via public Piped/Invidious APIs
-async function resolveYouTubeMp4Stream(ytId, onStatus) {
-  const instances = [
-    `https://pipedapi.kavin.rocks/streams/${ytId}`,
-    `https://pipedapi.tokhmi.xyz/streams/${ytId}`,
-    `https://pipedapi.moomoo.me/streams/${ytId}`,
-    `https://api.piped.projectsegfau.lt/streams/${ytId}`,
+// ELITE LAYER 1: Multi-Engine YouTube Blob Downloader (Python API + Invidious Local Proxy + Piped)
+async function downloadYouTubeAsBlob(ytId, fullUrl, pythonBackendUrl, onStatus) {
+  // 1. If user provided a Python yt-dlp Backend URL, use it first (100% reliable)
+  if (pythonBackendUrl && pythonBackendUrl.trim()) {
+    try {
+      if (onStatus) onStatus("Downloading via Python yt-dlp Backend Engine...");
+      const cleanBase = pythonBackendUrl.trim().replace(/\/$/, "");
+      const res = await fetch(
+        `${cleanBase}/download?url=${encodeURIComponent(fullUrl)}`
+      );
+      if (res.ok) {
+        const blob = await res.blob();
+        if (blob.size > 50000) return blob;
+      }
+    } catch (err) {
+      console.warn("Python backend unreachable, trying public tunnels...", err);
+    }
+  }
+
+  // 2. Try Invidious "?local=true" Proxied Stream Tunnels (Bypasses IP Lock!)
+  const invidiousInstances = [
+    "https://inv.tux.pizza",
+    "https://invidious.nerdvpn.de",
+    "https://invidious.Jing.rocks",
+    "https://invidious.privacyredirect.com",
+    "https://vid.puffyan.us",
   ];
 
-  for (const apiUrl of instances) {
+  for (const host of invidiousInstances) {
     try {
-      if (onStatus) onStatus("Resolving direct MP4 stream from YouTube link...");
-      const res = await fetch(apiUrl);
+      if (onStatus) onStatus(`Trying Invidious Proxy Tunnel (${host})...`);
+      // local=true forces the Invidious server to proxy the video bytes itself, bypassing IP lock!
+      const proxiedVideoUrl = `${host}/latest_version?id=${ytId}&itag=18&local=true`;
+      const blob = await fetchWithCorsFallback(proxiedVideoUrl);
+      if (blob && blob.size > 50000) {
+        return blob;
+      }
+    } catch {
+      // Try next instance
+    }
+  }
+
+  // 3. Try Piped API with proxied stream URLs
+  const pipedInstances = [
+    "https://pipedapi.kavin.rocks",
+    "https://pipedapi.tokhmi.xyz",
+    "https://api.piped.projectsegfau.lt",
+  ];
+
+  for (const api of pipedInstances) {
+    try {
+      if (onStatus) onStatus(`Trying Piped Stream Tunnel (${api})...`);
+      const res = await fetch(`${api}/streams/${ytId}`);
       if (!res.ok) continue;
       const data = await res.json();
       if (data && Array.isArray(data.videoStreams)) {
-        // Find a combined video+audio MP4 stream
-        const mp4Stream =
+        const mp4 =
           data.videoStreams.find(
             (s) => s.format === "MPEG_4" && s.videoOnly === false
           ) || data.videoStreams[0];
-        if (mp4Stream && mp4Stream.url) {
-          return mp4Stream.url;
+        if (mp4 && mp4.url) {
+          const blob = await fetchWithCorsFallback(mp4.url);
+          if (blob && blob.size > 50000) return blob;
         }
       }
     } catch {
-      // Try next public instance
+      // Try next instance
     }
   }
+
   return null;
 }
 
@@ -101,22 +142,29 @@ export default function VideoTrimmer() {
   const [videoFile, setVideoFile] = useState(null);
   const [videoUrl, setVideoUrl] = useState("");
   const [youtubeId, setYoutubeId] = useState(null);
-  const [videoDuration, setVideoDuration] = useState(300); // Default 5 mins (300s)
+  const [videoDuration, setVideoDuration] = useState(300);
   const [onlineTitle, setOnlineTitle] = useState("");
 
-  // Main Slider Range directly under the video player
+  // Master Slider Range directly under the video player
   const [masterStartSec, setMasterStartSec] = useState(0);
-  const [masterEndSec, setMasterEndSec] = useState(300);
+  const [masterEndSec, setMasterEndSec] = useState(60);
   const [selectedCutCount, setSelectedCutCount] = useState(1);
 
   const [urlInput, setUrlInput] = useState("");
+  const [pythonApiUrl, setPythonApiUrl] = useState("");
+  const [showAdvancedApi, setShowAdvancedApi] = useState(false);
   const [autoCaptionEnabled, setAutoCaptionEnabled] = useState(true);
+
+  // Live Tab Capture Bypass State (100% Unblockable Method)
+  const [isRecordingTab, setIsRecordingTab] = useState(false);
+  const mediaRecorderRef = useRef(null);
+  const recordedChunksRef = useRef([]);
 
   const [cuts, setCuts] = useState([
     {
       id: "cut-1",
       startTime: "00:00",
-      endTime: "05:00",
+      endTime: "01:00",
       aspectRatio: "9:16",
       overlayText: "Part 1 (Pehla Cut)",
     },
@@ -136,7 +184,7 @@ export default function VideoTrimmer() {
     };
   }, [videoUrl]);
 
-  // Helper: Generate N sequential cuts from Master Range with Auto-Numbering & Auto-Captions
+  // Generate N sequential cuts with +1s Smart Auto-Shift & Auto-Captions
   const generateSequentialCuts = (
     count,
     rangeStartSec,
@@ -153,11 +201,8 @@ export default function VideoTrimmer() {
     const newCuts = [];
     for (let i = 0; i < safeCount; i++) {
       const partNum = i + 1;
-      // Smart Auto-Shift: Part 1 starts at 00:00, Part 2 starts at Part 1 End + 1s
       const startSec =
-        i === 0
-          ? rangeStartSec
-          : rangeStartSec + i * segmentLength + 1;
+        i === 0 ? rangeStartSec : rangeStartSec + i * segmentLength + 1;
       const endSec =
         i === safeCount - 1
           ? rangeEndSec
@@ -205,7 +250,7 @@ export default function VideoTrimmer() {
     setExportedParts([]);
   };
 
-  // 2. Load Online URL / YouTube Link + Auto-Fetch Title for Auto-Caption
+  // 2. Load Online URL / YouTube Link + Auto-Fetch Title
   const handleLoadUrl = async (e) => {
     e.preventDefault();
     const trimmedUrl = urlInput.trim();
@@ -219,9 +264,8 @@ export default function VideoTrimmer() {
     }
 
     setExportedParts([]);
-    let fetchedTitle = "Online Video";
+    let fetchedTitle = "YouTube Short Clip";
 
-    // Auto-fetch video title from noembed (CORS-free API) for Auto-Captions
     try {
       const oembedRes = await fetch(
         `https://noembed.com/embed?url=${encodeURIComponent(trimmedUrl)}`
@@ -233,7 +277,7 @@ export default function VideoTrimmer() {
         }
       }
     } catch {
-      // Fallback if metadata not found
+      // Ignore metadata error
     }
 
     setOnlineTitle(fetchedTitle);
@@ -241,41 +285,88 @@ export default function VideoTrimmer() {
     const ytId = extractYouTubeId(trimmedUrl);
     if (ytId) {
       setYoutubeId(ytId);
+      setVideoUrl("");
       setVideoDuration(600);
       setMasterStartSec(0);
-      setMasterEndSec(300);
+      setMasterEndSec(60);
       setVideoFile({
-        name: `${fetchedTitle}.mp4`,
+        name: `${fetchedTitle.replace(/[^\w\s-]/g, "") || "yt_video"}.mp4`,
         isYouTube: true,
         ytId: ytId,
         originalUrl: trimmedUrl,
       });
 
-      // Auto-populate cuts with fetched online title
-      generateSequentialCuts(selectedCutCount, 0, 300, fetchedTitle);
-
-      // Try resolving direct MP4 stream in background so native player works
-      const resolvedStream = await resolveYouTubeMp4Stream(ytId);
-      if (resolvedStream) {
-        setVideoUrl(`https://corsproxy.io/?${encodeURIComponent(resolvedStream)}`);
-        setYoutubeId(null); // Switch to native video player if stream resolved!
-      }
+      generateSequentialCuts(selectedCutCount, 0, 60, fetchedTitle);
       return;
     }
 
-    // Direct Video URL (.mp4, R2 link, etc.) wrapped with CORS support
+    // Direct Video URL
     setYoutubeId(null);
     setVideoUrl(trimmedUrl);
     setVideoFile({
-      name:
-        trimmedUrl.split("/").pop().split("?")[0] || "online_video.mp4",
+      name: trimmedUrl.split("/").pop().split("?")[0] || "online_video.mp4",
       isRemoteUrl: true,
       url: trimmedUrl,
     });
-    generateSequentialCuts(selectedCutCount, 0, 300, fetchedTitle);
+    generateSequentialCuts(selectedCutCount, 0, 60, fetchedTitle);
   };
 
-  // Update duration when video loads in player
+  // ELITE LAYER 3: 100% Unblockable Browser Tab Capture Bypass
+  const handleStartTabCapture = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { displaySurface: "browser" },
+        audio: true,
+        preferCurrentTab: true,
+      });
+
+      recordedChunksRef.current = [];
+      const recorder = new MediaRecorder(stream, {
+        mimeType: MediaRecorder.isTypeSupported("video/webm;codecs=vp8,opus")
+          ? "video/webm;codecs=vp8,opus"
+          : "video/webm",
+      });
+
+      recorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) {
+          recordedChunksRef.current.push(e.data);
+        }
+      };
+
+      recorder.onstop = () => {
+        stream.getTracks().forEach((track) => track.stop());
+        const capturedBlob = new Blob(recordedChunksRef.current, {
+          type: "video/webm",
+        });
+        const capturedFile = new File(
+          [capturedBlob],
+          `${(onlineTitle || "captured_clip").replace(/[^\w\s-]/g, "")}.webm`,
+          { type: "video/webm" }
+        );
+        const localUrl = URL.createObjectURL(capturedFile);
+
+        setYoutubeId(null);
+        setVideoFile(capturedFile);
+        setVideoUrl(localUrl);
+        setIsRecordingTab(false);
+      };
+
+      mediaRecorderRef.current = recorder;
+      recorder.start(200);
+      setIsRecordingTab(true);
+    } catch (err) {
+      alert(
+        "Tab capture cancelled. Make sure to select 'This Tab' and enable 'Share tab audio'."
+      );
+    }
+  };
+
+  const handleStopTabCapture = () => {
+    if (mediaRecorderRef.current && isRecordingTab) {
+      mediaRecorderRef.current.stop();
+    }
+  };
+
   const handleLoadedMetadata = () => {
     if (videoRef.current && videoRef.current.duration) {
       const actualDuration = Math.floor(videoRef.current.duration);
@@ -293,7 +384,6 @@ export default function VideoTrimmer() {
     }
   };
 
-  // Master Slider Change (Directly below video player)
   const handleMasterSlider = (type, rawVal) => {
     const sec = parseInt(rawVal, 10) || 0;
     let newStart = masterStartSec;
@@ -312,13 +402,11 @@ export default function VideoTrimmer() {
     generateSequentialCuts(selectedCutCount, newStart, newEnd, onlineTitle);
   };
 
-  // Quick Selector: Choose How Many Cuts (1 to 10) at once
   const handleSelectCutCount = (count) => {
     setSelectedCutCount(count);
     generateSequentialCuts(count, masterStartSec, masterEndSec, onlineTitle);
   };
 
-  // Manual "+ Add New Cut" with +1s Smart Auto-Shift
   const handleAddCut = () => {
     if (cuts.length >= MAX_CUTS) {
       alert("Maximum 10 cuts allowed!");
@@ -352,7 +440,6 @@ export default function VideoTrimmer() {
     setSelectedCutCount(updated.length);
   };
 
-  // Edit Individual Cut Input
   const handleCutChange = (index, field, value) => {
     setCuts((prevCuts) => {
       const updatedCuts = [...prevCuts];
@@ -361,7 +448,6 @@ export default function VideoTrimmer() {
         [field]: value,
       };
 
-      // Smart Auto-Shift (+1s) for next part
       if (field === "endTime" && index + 1 < updatedCuts.length) {
         updatedCuts[index + 1] = {
           ...updatedCuts[index + 1],
@@ -379,10 +465,10 @@ export default function VideoTrimmer() {
     setSelectedCutCount(filtered.length);
   };
 
-  // Export All Cuts with Automatic CORS Proxy & YouTube Stream Fallback
+  // Export All Cuts
   const handleExportAllCuts = async () => {
     if (!videoFile && !videoUrl) {
-      alert("Pehle koi video file upload karein ya link load karein!");
+      alert("Pehle koi video upload karein ya link load karein!");
       return;
     }
 
@@ -392,28 +478,27 @@ export default function VideoTrimmer() {
 
       let sourceToProcess = videoFile;
 
-      // Case 1: If it's a YouTube link, resolve direct MP4 stream + fetch via CORS proxy
       if (videoFile?.isYouTube) {
-        const streamUrl = await resolveYouTubeMp4Stream(
+        const ytBlob = await downloadYouTubeAsBlob(
           videoFile.ytId,
+          videoFile.originalUrl,
+          pythonApiUrl,
           (msg) => setProgressText(msg)
         );
 
-        if (!streamUrl) {
-          throw new Error(
-            "YouTube security blocked direct stream extraction on this network. Tip: Upload the downloaded MP4 file from your device for instant 3GB trimming!"
+        if (!ytBlob) {
+          setIsProcessing(false);
+          setProgressText("");
+          alert(
+            "Public proxies are busy for this YouTube video! Click the yellow '100% Bypass: Record from Player' button right below the YouTube video to capture & cut it instantly without any server block!"
           );
+          return;
         }
 
-        const blob = await fetchWithCorsFallback(streamUrl, (msg) =>
-          setProgressText(msg)
-        );
-        sourceToProcess = new File([blob], videoFile.name || "youtube.mp4", {
+        sourceToProcess = new File([ytBlob], videoFile.name || "youtube.mp4", {
           type: "video/mp4",
         });
-      }
-      // Case 2: If it's a remote URL (.mp4 link), fetch through Multi-CORS Proxy
-      else if (videoFile?.isRemoteUrl) {
+      } else if (videoFile?.isRemoteUrl) {
         setProgressText("Downloading online video via CORS Proxy...");
         const blob = await fetchWithCorsFallback(videoFile.url, (msg) =>
           setProgressText(msg)
@@ -453,7 +538,7 @@ export default function VideoTrimmer() {
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 p-4 sm:p-6">
-      {/* Top Bar: Upload + Online Link Input */}
+      {/* Top Header */}
       <header className="max-w-7xl mx-auto mb-6 border-b border-slate-800 pb-5 space-y-4">
         <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
           <div>
@@ -461,21 +546,47 @@ export default function VideoTrimmer() {
               Smart Video Trimmer & Multi-Cut Maker
             </h1>
             <p className="text-xs sm:text-sm text-slate-400">
-              Slide under video to cut • Choose 1 to 10 Parts • Auto-Numbering
-              & Auto-Caption
+              Slide under video to cut • Choose 1 to 10 Parts • Auto-Numbering &
+              Auto-Caption
             </p>
           </div>
 
-          <label className="cursor-pointer bg-indigo-600 hover:bg-indigo-500 text-white px-5 py-2.5 rounded-lg font-semibold text-sm transition text-center shadow-lg shadow-indigo-600/20">
-            Upload Video (Max 3GB)
-            <input
-              type="file"
-              accept="video/*"
-              onChange={handleFileUpload}
-              className="hidden"
-            />
-          </label>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setShowAdvancedApi(!showAdvancedApi)}
+              className="bg-slate-800 hover:bg-slate-700 text-slate-300 px-3 py-2.5 rounded-lg text-xs font-semibold border border-slate-700 transition"
+            >
+              {showAdvancedApi ? "Hide Python API" : "Connect Python yt-dlp"}
+            </button>
+
+            <label className="cursor-pointer bg-indigo-600 hover:bg-indigo-500 text-white px-5 py-2.5 rounded-lg font-semibold text-sm transition text-center shadow-lg shadow-indigo-600/20">
+              Upload Video (Max 3GB)
+              <input
+                type="file"
+                accept="video/*"
+                onChange={handleFileUpload}
+                className="hidden"
+              />
+            </label>
+          </div>
         </div>
+
+        {/* Optional Python yt-dlp Backend Connector Bar */}
+        {showAdvancedApi && (
+          <div className="bg-indigo-950/40 border border-indigo-500/30 rounded-xl p-3 flex flex-col sm:flex-row items-stretch sm:items-center gap-2.5">
+            <span className="text-xs font-bold text-indigo-300 shrink-0">
+              Python yt-dlp Server URL:
+            </span>
+            <input
+              type="url"
+              placeholder="e.g. https://my-ytdlp-api.onrender.com (Optional)"
+              value={pythonApiUrl}
+              onChange={(e) => setPythonApiUrl(e.target.value)}
+              className="flex-1 bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-white"
+            />
+          </div>
+        )}
 
         {/* Paste Online Video Link Bar */}
         <form
@@ -487,7 +598,7 @@ export default function VideoTrimmer() {
           </span>
           <input
             type="url"
-            placeholder="Paste direct .mp4 link or video URL here..."
+            placeholder="Paste YouTube link or direct .mp4 URL here..."
             value={urlInput}
             onChange={(e) => setUrlInput(e.target.value)}
             className="flex-1 bg-slate-950 border border-slate-700 rounded-lg px-3.5 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500"
@@ -503,7 +614,7 @@ export default function VideoTrimmer() {
 
       {/* Main Two-Column Layout */}
       <main className="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-12 gap-6">
-        {/* LEFT COLUMN: Video Preview + Direct Cut Slider + 1-10 Cut Selector */}
+        {/* LEFT COLUMN: Video Preview + Unblockable Bypass + Cut Slider */}
         <section className="lg:col-span-6 bg-slate-900 border border-slate-800 rounded-xl p-4 flex flex-col gap-4 h-fit lg:sticky lg:top-6">
           <div className="flex items-center justify-between">
             <h2 className="text-base font-bold text-white">
@@ -516,14 +627,48 @@ export default function VideoTrimmer() {
             )}
           </div>
 
-          {/* Video Player Box */}
           {youtubeId ? (
-            <iframe
-              src={`https://www.youtube.com/embed/${youtubeId}`}
-              title="YouTube Preview"
-              className="w-full rounded-lg bg-black aspect-video border border-slate-800"
-              allowFullScreen
-            />
+            <div className="space-y-3">
+              <iframe
+                src={`https://www.youtube.com/embed/${youtubeId}?autoplay=1`}
+                title="YouTube Preview"
+                className="w-full rounded-lg bg-black aspect-video border border-slate-800"
+                allow="autoplay; encrypted-media"
+                allowFullScreen
+              />
+
+              {/* 100% UNBLOCKABLE BROWSER STREAM CAPTURE BAR */}
+              <div className="bg-amber-950/40 border border-amber-500/40 rounded-xl p-3 flex flex-col sm:flex-row items-center justify-between gap-3">
+                <div className="text-xs text-amber-200">
+                  <p className="font-bold text-amber-400">
+                    100% Unblockable YouTube Bypass (Zero Server Needed):
+                  </p>
+                  <p className="text-[11px] text-amber-300/80">
+                    Play the part you want in the YouTube player above, click{" "}
+                    <strong>Record from Player</strong>, and stop when done. It
+                    converts straight into a local video ready for 9:16 cutting!
+                  </p>
+                </div>
+
+                {!isRecordingTab ? (
+                  <button
+                    type="button"
+                    onClick={handleStartTabCapture}
+                    className="bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs px-4 py-2.5 rounded-lg shrink-0 transition shadow-lg shadow-amber-500/20"
+                  >
+                    100% Bypass: Record from Player
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={handleStopTabCapture}
+                    className="bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs px-4 py-2.5 rounded-lg shrink-0 animate-pulse"
+                  >
+                    Stop Recording & Load Clip
+                  </button>
+                )}
+              </div>
+            </div>
           ) : videoUrl ? (
             <video
               ref={videoRef}
@@ -539,8 +684,7 @@ export default function VideoTrimmer() {
                 Koi Video Select Nahi Hai
               </p>
               <p className="text-slate-500 text-xs">
-                Upar button se video upload karein ya link paste karein. Jaise
-                hi video aayegi, neeche slider se cut select karein!
+                Upar button se video upload karein ya link paste karein.
               </p>
             </div>
           )}
@@ -557,7 +701,6 @@ export default function VideoTrimmer() {
               </span>
             </div>
 
-            {/* Visual Highlight Bar */}
             <div className="relative h-3 bg-slate-800 rounded-full overflow-hidden">
               <div
                 className="absolute top-0 bottom-0 bg-gradient-to-r from-indigo-500 to-emerald-500 rounded-full"
@@ -568,7 +711,6 @@ export default function VideoTrimmer() {
               />
             </div>
 
-            {/* Start & End Range Sliders Directly Under Video */}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div>
                 <label className="block text-[11px] text-slate-400 mb-1">
@@ -675,7 +817,6 @@ export default function VideoTrimmer() {
             </div>
           </div>
 
-          {/* Auto-Caption Toggle Bar */}
           <div className="mb-3 flex items-center justify-between bg-slate-950 border border-slate-800 px-3.5 py-2 rounded-lg">
             <label className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer">
               <input
@@ -749,7 +890,6 @@ export default function VideoTrimmer() {
                     )}
                   </div>
 
-                  {/* Inputs for Start, End, Ratio, Auto-Caption */}
                   <div className="grid grid-cols-2 sm:grid-cols-12 gap-2.5">
                     <div className="sm:col-span-2">
                       <label className="block text-[10px] text-slate-400 mb-1">
@@ -817,7 +957,7 @@ export default function VideoTrimmer() {
             })}
           </div>
 
-          {/* Ready to Download Section (Sequentially Numbered) */}
+          {/* Ready to Download Section */}
           {exportedParts.length > 0 && (
             <div className="mt-5 pt-4 border-t border-slate-800">
               <h3 className="text-sm font-bold text-emerald-400 mb-3">
